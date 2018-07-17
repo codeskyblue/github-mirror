@@ -12,13 +12,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/DeanThompson/syncmap"
+	"github.com/c2h5oh/datasize"
 	"github.com/franela/goreq"
-	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 )
 
@@ -33,23 +35,95 @@ func HashString(s string) string {
 	return fmt.Sprintf("%x", m.Sum(nil))
 }
 
+type Status struct {
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	Copied   int    `json:"int"`
+	Total    int    `json:"int"`
+}
+
+func (s *Status) Write(p []byte) (int, error) {
+	n := len(p)
+	s.Copied += n
+	return n, nil
+}
+
 type DownloadCache struct {
-	CacheDir string
-	GetProxy func() string
-	mu       sync.Mutex
-	workers  map[string]bool
-	waiters  map[string][]chan error
+	CacheDir  string
+	GetProxy  func() string
+	mu        sync.Mutex
+	dashboard *syncmap.SyncMap
+	workers   map[string]bool
+	waiters   map[string][]chan error
+	serverMux *http.ServeMux
 }
 
 func NewDownloadCache(cacheDir string) *DownloadCache {
 	if _, err := os.Stat(cacheDir); err != nil {
 		os.MkdirAll(cacheDir, 0755)
 	}
-	return &DownloadCache{
-		CacheDir: cacheDir,
-		workers:  make(map[string]bool),
-		waiters:  make(map[string][]chan error),
+	dc := &DownloadCache{
+		CacheDir:  cacheDir,
+		workers:   make(map[string]bool),
+		waiters:   make(map[string][]chan error),
+		dashboard: syncmap.New(),
 	}
+	dc.initServeMux()
+	return dc
+}
+
+func (d *DownloadCache) initServeMux() {
+	m := http.NewServeMux()
+
+	mirrors := make([]MirrorRule, 0)
+	mirrors = append(mirrors, MirrorRule{
+		regexp.MustCompile(`^/`),
+		"https://github.com/",
+	})
+
+	m.HandleFunc("/_dashboard", func(w http.ResponseWriter, r *http.Request) {
+		output := "<html><body><h2>Dashboard</h2><ul>"
+		for item := range d.dashboard.IterItems() {
+			st := item.Value.(*Status)
+			percent := 0.0
+			if st.Total > 0 {
+				percent = float64(st.Copied) * 100 / float64(st.Total)
+			}
+			output += "<li>" + st.URL + "&nbsp;&nbsp;" +
+				fmt.Sprintf("%.1f%% - %s / %s", percent,
+					datasize.ByteSize(st.Copied).HR(), datasize.ByteSize(st.Total).HR()) + "</li>"
+		}
+		output += "</ul></body></html>"
+		io.WriteString(w, output)
+	})
+
+	m.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
+		url := req.URL.Path
+		matches := regexp.MustCompile(`.*/([^/?]+)`).FindStringSubmatch(url)
+		downloadName := "cached.file"
+		if matches != nil {
+			downloadName = matches[1]
+		}
+		urlPrefix := ""
+		for _, mirror := range mirrors {
+			if mirror.Pattern.MatchString(url) {
+				urlPrefix = mirror.URLPrefix
+			}
+		}
+		if urlPrefix == "" {
+			io.WriteString(rw, "Github Mirror")
+			return
+		}
+		mirrorURL := strings.TrimSuffix(urlPrefix, "/") + req.RequestURI
+		log.Println("mirror url:", mirrorURL)
+		err := d.DownloadAndWait(mirrorURL, downloadName)
+		if err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+		downcache.ServeFile(rw, req, mirrorURL)
+	})
+	d.serverMux = m
 }
 
 func (d *DownloadCache) unsafeAddWaiter(hash string) chan error {
@@ -83,6 +157,7 @@ func (d *DownloadCache) download(url string, filename string) (err error) {
 			req.Proxy = proxy
 		}
 	}
+	hash := HashString(url)
 
 	res, err := req.Do()
 	if err != nil {
@@ -94,6 +169,11 @@ func (d *DownloadCache) download(url string, filename string) (err error) {
 	if res.StatusCode != 200 {
 		return errors.New("remote: " + res.Status)
 	}
+	fileLength, err := strconv.Atoi(res.Header.Get("Content-Length"))
+	if err != nil {
+		log.Printf("WARNING: %s content-length unknown", url)
+	}
+
 	tmpFilename := filepath.Join(d.CacheDir, HashString(url)+".tmp")
 	targetDir := d.downloadDir(url)
 
@@ -109,12 +189,25 @@ func (d *DownloadCache) download(url string, filename string) (err error) {
 	if err != nil {
 		return errors.Wrap(err, "create file")
 	}
+
+	st := &Status{
+		URL:      url,
+		Filename: filename,
+		Total:    fileLength,
+	}
+
+	d.dashboard.Set(hash, st)
+	defer d.dashboard.Delete(hash)
+
 	var size int64
-	size, err = io.Copy(f, res.Body)
+	size, err = io.Copy(io.MultiWriter(st, f), res.Body)
 	if err != nil {
 		f.Close()
 		os.Remove(tmpFilename)
 		return err
+	}
+	if err = f.Close(); err != nil {
+		return
 	}
 
 	if err = os.MkdirAll(targetDir, 0755); err != nil {
@@ -175,7 +268,7 @@ func (d *DownloadCache) DownloadAndWait(url string, filename string) error {
 	d.mu.Lock()
 	d.unsafeNotifyWaiters(hash, err)
 	d.mu.Unlock()
-	log.Println("finished", filename)
+	log.Println("finished", filename, err)
 	return err
 }
 
@@ -198,6 +291,9 @@ func (d *DownloadCache) ServeFile(w http.ResponseWriter, req *http.Request, url 
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	mtime := time.Now()
+	os.Chtimes(metaPath, mtime, mtime)
+
 	f, err := os.Open(filepath.Join(dir, "cached.file"))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -208,30 +304,37 @@ func (d *DownloadCache) ServeFile(w http.ResponseWriter, req *http.Request, url 
 	http.ServeContent(w, req, info.Filename, modtime, f)
 }
 
-var downcache *DownloadCache
-
-func init() {
-	r := mux.NewRouter()
-	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "Github mirror, test with some github file under releases")
-	})
-
-	// http://localhost:8000/openatx/android-uiautomator-server/releases/download/1.1.4/app-uiautomator-test.apk
-	// http://localhost:8000/openatx/atx-agent/releases/download/0.3.5/atx-agent_0.3.5_checksums.txt
-	r.HandleFunc("/{repo}/{name}/releases/download/{version}/{filename}", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("request:", r.RequestURI)
-		filename := mux.Vars(r)["filename"]
-		origURL := "https://github.com" + r.RequestURI
-		err := downcache.DownloadAndWait(origURL, filename)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		downcache.ServeFile(w, r, origURL)
-	})
-
-	http.Handle("/", r)
+type MirrorRule struct {
+	Pattern   *regexp.Regexp
+	URLPrefix string
 }
+
+// Clean remove file which not accessed to long
+// Note: every request will update meta.json mtime
+func (d *DownloadCache) Clean(keepDuration time.Duration) {
+	filepath.Walk(d.CacheDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			fmt.Printf("prevent panic by handling failure accessing a path %q: %v\n", d.CacheDir, err)
+			return err
+		}
+		if info.Name() != "meta.json" {
+			return nil
+		}
+
+		existsDuration := time.Since(info.ModTime())
+		if existsDuration > keepDuration {
+			log.Println("clean", path, existsDuration)
+			os.RemoveAll(filepath.Dir(path))
+		}
+		return nil
+	})
+}
+
+func (d *DownloadCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	d.serverMux.ServeHTTP(w, r)
+}
+
+var downcache *DownloadCache
 
 func main() {
 	var proxy string
@@ -241,6 +344,13 @@ func main() {
 	flag.Parse()
 
 	downcache = NewDownloadCache(dataDir)
+	go func() {
+		for {
+			downcache.Clean(time.Hour * 24 * 7)
+			time.Sleep(1 * time.Hour)
+		}
+	}()
+
 	if strings.HasPrefix(proxy, "http://") {
 		downcache.GetProxy = func() string {
 			return proxy
@@ -257,5 +367,5 @@ func main() {
 		}
 	}
 	log.Printf("github-mirror listen on :%d", port)
-	http.ListenAndServe(":"+strconv.Itoa(port), nil)
+	http.ListenAndServe(":"+strconv.Itoa(port), downcache)
 }

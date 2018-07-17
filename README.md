@@ -28,5 +28,8 @@ Change download url to <http://localhost:8000/openatx/atx-agent/releases/downloa
 If multi people request one resources, only one download thread will be created.
 And when downloaded, every download request will be satisfied.
 
+
+View <http://localhost:8000/_dashboard> to see current downloading progress.
+
 # LICENSE
 [MIT](LICENSE)
