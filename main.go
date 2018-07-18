@@ -38,8 +38,8 @@ func HashString(s string) string {
 type Status struct {
 	URL      string `json:"url"`
 	Filename string `json:"filename"`
-	Copied   int    `json:"int"`
-	Total    int    `json:"int"`
+	Copied   int    `json:"copied"`
+	Total    int    `json:"total"`
 }
 
 func (s *Status) Write(p []byte) (int, error) {
