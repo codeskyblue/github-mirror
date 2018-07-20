@@ -29,6 +29,10 @@ var (
 	dataDir string
 )
 
+func init() {
+	log.SetFlags(log.Lshortfile | log.LstdFlags)
+}
+
 func HashString(s string) string {
 	m := md5.New()
 	m.Write([]byte(s))
@@ -140,6 +144,7 @@ func (d *DownloadCache) unsafeNotifyWaiters(hash string, err error) {
 		ch <- err
 	}
 	delete(d.waiters, hash)
+	delete(d.workers, hash)
 }
 
 func (d *DownloadCache) download(url string, filename string) (err error) {
